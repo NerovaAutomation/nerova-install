@@ -1,70 +1,82 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64) ARCH=amd64 ;;
-  aarch64|arm64) ARCH=arm64 ;;
-  *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
-esac
+MANIFEST_URL=${NEROVA_MANIFEST_URL:-"https://raw.githubusercontent.com/NerovaAutomation/nerova-install/main/manifest.json"}
+INSTALL_ROOT=${NEROVA_HOME:-"$HOME/.nerovaagent"}
+BIN_DIR=${NEROVA_BIN:-"$HOME/.local/bin"}
+TMP_DIR=$(mktemp -d)
+TRAP_ERR=1
 
-PYTHON=$(command -v python3 || command -v python || true)
-if [ -z "$PYTHON" ]; then
-  echo "python3 (or python) is required to resolve the release asset" >&2
-  exit 1
-fi
-
-export NEROVA_OS="$OS"
-export NEROVA_ARCH="$ARCH"
-export NEROVA_VERSION=${NEROVA_VERSION:-latest}
-
-RELEASE_INFO=$($PYTHON <<'PY'
-import json, os, sys, urllib.request
-repo = "NerovaAutomation/nerova-runtime"
-platform = os.environ.get("NEROVA_OS")
-arch = os.environ.get("NEROVA_ARCH")
-version = os.environ.get("NEROVA_VERSION", "latest")
-if version == "latest":
-    api_url = f"https://api.github.com/repos/{repo}/releases/latest"
-else:
-    api_url = f"https://api.github.com/repos/{repo}/releases/tags/{version}"
-req = urllib.request.Request(api_url, headers={
-    "Accept": "application/vnd.github+json",
-    "User-Agent": "nerovaagent-installer"
-})
-with urllib.request.urlopen(req) as resp:
-    data = json.load(resp)
-tag = data["tag_name"]
-asset_name = f"nerova-agent-{tag}-{platform}-{arch}.sh"
-for asset in data.get("assets", []):
-    if asset.get("name") == asset_name:
-        print(tag)
-        print(asset.get("browser_download_url"))
-        break
-else:
-    sys.exit(f"Installer {asset_name} not found in release {tag}")
-PY
-)
-RELEASE_TAG=$(echo "$RELEASE_INFO" | sed -n '1p')
-RELEASE_URL=$(echo "$RELEASE_INFO" | sed -n '2p')
-
-if [ -z "$RELEASE_URL" ]; then
-  echo "Failed to resolve download URL" >&2
-  exit 1
-fi
-
-INSTALL_DIR=${NEROVA_HOME:-/opt/nerova}
-BIN_DIR=${NEROVA_BIN:-/usr/local/bin}
-INSTALLER=$(mktemp /tmp/nerova-agent-XXXX.sh)
-trap 'rm -f "$INSTALLER"' EXIT
+cleanup() {
+  local status=$?
+  if [[ $TRAP_ERR -ne 0 && -d "$INSTALL_ROOT/frontend" ]]; then
+    printf '\n[nerovaagent] Installation failed. Existing installation remains untouched.\n' >&2
+  fi
+  rm -rf "$TMP_DIR"
+  exit $status
+}
+trap 'cleanup' EXIT
 
 if ! command -v curl >/dev/null 2>&1; then
-  echo "curl is required to download the Nerova agent installer" >&2
+  echo "curl is required to install nerovaagent" >&2
   exit 1
 fi
 
-echo "Downloading Nerova agent runtime from $RELEASE_URL (tag $RELEASE_TAG)"
-curl -fsSL "$RELEASE_URL" -o "$INSTALLER"
-chmod +x "$INSTALLER"
-NEROVA_HOME="$INSTALL_DIR" NEROVA_BIN="$BIN_DIR" "$INSTALLER"
+if ! command -v tar >/dev/null 2>&1; then
+  echo "tar is required to install nerovaagent" >&2
+  exit 1
+fi
+
+PYTHON=$(command -v python3 || command -v python || true)
+if [[ -z "$PYTHON" ]]; then
+  echo "python3 (or python) is required to parse the install manifest" >&2
+  exit 1
+fi
+
+mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
+
+MANIFEST_JSON=$(curl -fsSL "$MANIFEST_URL")
+if [[ -z "$MANIFEST_JSON" ]]; then
+  echo "Failed to download install manifest" >&2
+  exit 1
+fi
+
+VERSION=$(printf '%s' "$MANIFEST_JSON" | "$PYTHON" -c 'import json,sys; data=json.load(sys.stdin); print(data.get("version",""))')
+ASSET_URL=$(printf '%s' "$MANIFEST_JSON" | "$PYTHON" -c 'import json,sys; data=json.load(sys.stdin); print(data.get("url",""))')
+if [[ -z "$ASSET_URL" ]]; then
+  echo "Manifest missing asset URL" >&2
+  exit 1
+fi
+
+PKG_TGZ="$TMP_DIR/nerovaagent-frontend.tgz"
+mkdir -p "$TMP_DIR/pkg"
+
+echo "[nerovaagent] Downloading frontend package ${VERSION:-latest}"
+curl -fsSL "$ASSET_URL" -o "$PKG_TGZ"
+
+tar -xzf "$PKG_TGZ" -C "$TMP_DIR/pkg"
+PKG_DIR="$TMP_DIR/pkg/package"
+if [[ ! -d "$PKG_DIR" ]]; then
+  echo "Unexpected package layout in archive" >&2
+  exit 1
+fi
+
+TARGET_DIR="$INSTALL_ROOT/frontend"
+rm -rf "$TARGET_DIR"
+mkdir -p "$TARGET_DIR"
+rsync -a "$PKG_DIR/" "$TARGET_DIR/"
+
+pushd "$TARGET_DIR" >/dev/null
+npm install --omit=dev
+npx playwright install chromium
+popd >/dev/null
+
+ln -sf "$TARGET_DIR/bin/nerovaagent.js" "$BIN_DIR/nerovaagent"
+chmod +x "$TARGET_DIR/bin/nerovaagent.js"
+
+TRAP_ERR=0
+
+cat <<MSG
+[nerovaagent] Frontend CLI installed to $TARGET_DIR${VERSION:+ (version $VERSION)}
+[nerovaagent] Symlink created at $BIN_DIR/nerovaagent
+MSG
